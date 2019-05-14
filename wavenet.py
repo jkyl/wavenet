@@ -59,7 +59,7 @@ class WaveNet(Model):
   def train(self, mp3_file):
     self.compile(loss='mse', optimizer=Adam(3e-4))
     data = self.get_data(mp3_file)
-    self.fit(data, steps_per_epoch=100, epochs=100)
+    self.fit(data, steps_per_epoch=100, epochs=1000)
 
   @_scoped_staticmethod
   def CausalResidual(x, x0):
