@@ -31,7 +31,8 @@ def _variable_scope(function):
 
 class WaveNet(Model):
   _sampling_rate = 44100 # Hz
-  
+  _quantization = 256
+
   @staticmethod
   @_variable_scope
   def CausalResidual(x, x0):
@@ -64,29 +65,33 @@ class WaveNet(Model):
       dilation = 2 ** octave
       x = WaveNet.CausalLayer(x, width, dilation)
     return x
-  
-  def __init__(self, blocks=4, octaves_per_block=13):
-    inp = Input((None, 2))
-    x = Embedding(256, 8)(inp)
+
+  @staticmethod
+  def forward_pass(x, blocks, octaves_per_block):
+    x = Embedding(WaveNet._quantization, 8)(x)
     x = Reshape((-1, 16))(x)
     for block in range(blocks):
       width = 16 * 2 ** block
-      x = self.CausalBlock(x, width, octaves_per_block)
+      x = WaveNet.CausalBlock(x, width, octaves_per_block)
     x = Activation('relu')(x)
-    x = Conv1D(512, 1)(x)
-    out = Reshape((-1, 2, 256))(x)
+    x = Conv1D(2*WaveNet._quantization, 1)(x)
+    return Reshape((-1, 2, WaveNet._quantization))(x)
+  
+  @staticmethod
+  def quantize(x, q=_quantization):
+    companded = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
+    bins = np.linspace(-1, 1, q + 1)
+    return np.digitize(companded, bins).astype(np.int32) - 1
+  
+  def __init__(self, blocks=4, octaves_per_block=13):
+    inp = Input((None, 2))
+    out = WaveNet.forward_pass(inp, blocks, octaves_per_block)
     super(WaveNet, self).__init__(inp, out)
-    self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1)
     self.summary()
+    self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1)
     print('Receptive field:', self.receptive_field)
 
-  @staticmethod
-  def quantize(x, levels=256):
-    companded = np.sign(x) * np.log(1 + (levels - 1) * np.abs(x)) / np.log(levels)
-    bins = np.linspace(-1, 1, levels + 1)
-    return np.digitize(companded, bins).astype(np.int32) - 1
-
-  def get_data(self, data_dir, batch_size=8, length_secs=1):
+  def get_data(self, data_dir, batch_size=4, length_secs=1):
     data = []
     for mp3_file in glob.glob(os.path.join(data_dir, '*.mp3')):
       segment = pydub.AudioSegment.from_mp3(mp3_file)
@@ -120,7 +125,7 @@ class WaveNet(Model):
     loss = tf.reduce_mean(
       tf.nn.sparse_softmax_cross_entropy_with_logits(
         logits=logits, labels=Y_train))
-    optimizer = tf.train.AdamOptimizer(5e-4)
+    optimizer = tf.train.AdamOptimizer(1e-4)
     train_op = optimizer.minimize(loss, var_list=self.trainable_weights)
     with tf.Session() as sess:
       sess.run(tf.global_variables_initializer())
