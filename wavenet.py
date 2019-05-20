@@ -119,13 +119,15 @@ class WaveNet(Model):
       'ckpt_iter-{}.h5'.format(str(iteration).zfill(10))))
 
   def train(self, data_dir, model_dir):
-    X_train, Y_train = self.get_data(data_dir) 
-    logits = self(X_train)
+    features, labels = self.get_data(data_dir) 
+    logits = self(features)
     loss = tf.reduce_mean(
       tf.nn.sparse_softmax_cross_entropy_with_logits(
-        logits=logits, labels=Y_train))
-    optimizer = tf.train.AdamOptimizer(1e-4)
-    train_op = optimizer.minimize(loss, var_list=self.trainable_weights)
+        logits=logits, labels=labels))
+    step = tf.train.create_global_step()
+    learning_rate = 1e-3 * 2. ** -tf.cast(step // 10000, tf.float32)
+    optimizer = tf.train.AdamOptimizer(learning_rate)
+    train_op = optimizer.minimize(loss, step, self.trainable_weights)
     with tf.Session() as sess:
       sess.run(tf.global_variables_initializer())
       self.fancy_save(model_dir)
@@ -141,6 +143,7 @@ class WaveNet(Model):
           loss_ = []
         now = time.time()
         if now - time_ > 3600: # every hour
+          print('saving checkpoint at iter:', iter_)
           self.fancy_save(model_dir, iter_)
           time_ = now
           
