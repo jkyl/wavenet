@@ -19,6 +19,7 @@ import numpy as np
 import functools
 import pydub
 import glob
+import time
 import os
 
 def _variable_scope(function):
@@ -29,63 +30,55 @@ def _variable_scope(function):
       return function(*args, **kwargs)
   return wrapped
 
+@_variable_scope
+def CausalResidual(x, x0):
+  def crop(inputs):
+    x, x0 = inputs
+    length_x = tf.shape(x)[1]
+    return x0[:, -length_x:]
+  x0 = Lambda(crop)([x, x0])
+  extra = int_shape(x)[-1] - int_shape(x0)[-1]
+  if extra:
+    extra = Conv1D(extra, 1)(x0)
+    x0 = Concatenate()([x0, extra])
+  return Add()([x, x0])
+
+@_variable_scope
+def CausalLayer(x, width, dilation):
+  x0 = x
+  x = Activation('relu')(x)
+  x = Conv1D(width, 2, dilation_rate=dilation)(x)
+  filt, gate = Lambda(lambda x: [x[..., :width//2], x[..., width//2:]])(x)
+  x = Multiply()([Activation('tanh')(filt), Activation('sigmoid')(gate)])
+  x = Conv1D(width, 1)(x)
+  return CausalResidual(x, x0)
+
+@_variable_scope
+def CausalBlock(x, width, octaves): 
+  for octave in range(octaves):
+    dilation = 2 ** octave
+    x = CausalLayer(x, width, dilation)
+  return x
+
+def quantize(x, q):
+  companded = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
+  bins = np.linspace(-1, 1, q + 1)
+  quantized = np.digitize(companded, bins).astype(np.int32) - 1
+  return quantized
+
 class WaveNet(Model):
   _sampling_rate = 44100 # Hz
-  _quantization = 256
-
-  @staticmethod
-  @_variable_scope
-  def CausalResidual(x, x0):
-    def crop(inputs):
-      x, x0 = inputs
-      length_x = tf.shape(x)[1]
-      return x0[:, -length_x:]
-    x0 = Lambda(crop)([x, x0])
-    extra = int_shape(x)[-1] - int_shape(x0)[-1]
-    if extra:
-      extra = Conv1D(extra, 1)(x0)
-      x0 = Concatenate()([x0, extra])
-    return Add()([x, x0])
-
-  @staticmethod
-  @_variable_scope
-  def CausalLayer(x, width, dilation):
-    x0 = x
-    x = Activation('relu')(x)
-    x = Conv1D(width, 2, dilation_rate=dilation)(x)
-    filt, gate = Lambda(lambda x: [x[..., :width//2], x[..., width//2:]])(x)
-    x = Multiply()([Activation('tanh')(filt), Activation('sigmoid')(gate)])
-    x = Conv1D(width, 1)(x)
-    return WaveNet.CausalResidual(x, x0)
-  
-  @staticmethod
-  @_variable_scope
-  def CausalBlock(x, width, octaves): 
-    for octave in range(octaves):
-      dilation = 2 ** octave
-      x = WaveNet.CausalLayer(x, width, dilation)
-    return x
-
-  @staticmethod
-  def forward_pass(x, blocks, octaves_per_block):
-    x = Embedding(WaveNet._quantization, 8)(x)
+  _quantization = 256 # 8-bit
+   
+  def __init__(self, blocks=5, octaves_per_block=13):
+    inp = Input((None, 2)) 
+    x = Embedding(self._quantization, 8)(inp)
     x = Reshape((-1, 16))(x)
     for block in range(blocks):
-      width = 16 * 2 ** block
-      x = WaveNet.CausalBlock(x, width, octaves_per_block)
+      x = CausalBlock(x, 16 * 2 ** block, octaves_per_block)
     x = Activation('relu')(x)
-    x = Conv1D(2*WaveNet._quantization, 1)(x)
-    return Reshape((-1, 2, WaveNet._quantization))(x)
-  
-  @staticmethod
-  def quantize(x, q=_quantization):
-    companded = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
-    bins = np.linspace(-1, 1, q + 1)
-    return np.digitize(companded, bins).astype(np.int32) - 1
-  
-  def __init__(self, blocks=4, octaves_per_block=13):
-    inp = Input((None, 2))
-    out = WaveNet.forward_pass(inp, blocks, octaves_per_block)
+    x = Conv1D(2 * self._quantization, 1)(x)
+    out = Reshape((-1, 2, self._quantization))(x) 
     super(WaveNet, self).__init__(inp, out)
     self.summary()
     self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1)
@@ -98,14 +91,14 @@ class WaveNet(Model):
       array = np.stack([
         np.frombuffer(channel._data, dtype=np.int16)
         for channel in segment.split_to_mono()], axis=1)
-      padding = np.zeros((self.receptive_field, 2), dtype=np.int16)
-      array = np.concatenate([padding, array], axis=0)
       array = array.astype(np.float32) 
       array /= np.iinfo(np.int16).max
       data.append(array)
-    data.append(padding.astype(np.float32))
+    padding = np.zeros((self.receptive_field, 2), dtype=np.float32)
+    data = [data[i//2] if i % 2 else padding 
+            for i in range(2 * len(data) + 1)]
     data = np.concatenate(data, axis=0)
-    data = self.quantize(data)
+    data = quantize(data, self._quantization)
     length = self._sampling_rate * length_secs
     def sample():
       while True:
@@ -115,11 +108,17 @@ class WaveNet(Model):
     ds = tf.data.Dataset.from_generator(
       sample, (tf.int32, tf.int32), 
       ((length - 1, 2), (length - self.receptive_field, 2)))
-    ds = ds.batch(batch_size)
+    ds = ds.batch(batch_size) 
     ds = ds.prefetch(8)
     return ds.make_one_shot_iterator().get_next()
 
-  def train(self, data_dir):
+  def fancy_save(self, model_dir, iteration=0):
+    if not os.path.exists(model_dir):
+      os.makedirs(model_dir)
+    self.save(os.path.join(model_dir,
+      'ckpt_iter-{}.h5'.format(str(iteration).zfill(10))))
+
+  def train(self, data_dir, model_dir):
     X_train, Y_train = self.get_data(data_dir) 
     logits = self(X_train)
     loss = tf.reduce_mean(
@@ -129,10 +128,25 @@ class WaveNet(Model):
     train_op = optimizer.minimize(loss, var_list=self.trainable_weights)
     with tf.Session() as sess:
       sess.run(tf.global_variables_initializer())
-      for i in range(1000):
-        for j in range(100):
-          print(sess.run([train_op, loss])[1])
-
+      self.fancy_save(model_dir)
+      tf.get_default_graph().finalize() 
+      iter_ = 0
+      loss_ = []
+      time_ = time.time()
+      while True:
+        loss_ += sess.run([train_op, loss])[1:]
+        iter_ += 1
+        if not iter_ % 100:
+          print('iter:', iter_, '\tloss:', np.mean(loss_))
+          loss_ = []
+        now = time.time()
+        if now - time_ > 3600: # every hour
+          self.fancy_save(model_dir, iter_)
+          time_ = now
+          
 if __name__ == '__main__':
-  WaveNet().train('/Volumes/4TB/itunes/Josquin des Prez/Missa Pange lingua - Missa La sol fa re mi/')
+  WaveNet().train(
+    '/Volumes/4TB/itunes/Josquin des Prez/Missa Pange lingua - Missa La sol fa re mi/',
+    './checkpoints'
+  )
 
