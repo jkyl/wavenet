@@ -61,10 +61,16 @@ def CausalBlock(x, width, octaves):
   return x
 
 def quantize(x, q):
-  companded = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
+  compressed = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
   bins = np.linspace(-1, 1, q + 1)
-  quantized = np.digitize(companded, bins).astype(np.int32) - 1
-  return quantized
+  quantized = np.digitize(compressed, bins)
+  return quantized.astype(np.int32) - 1
+
+def dequantize(x, q):
+  bins = np.linspace(-1, 1, q + 1)
+  centers = (bins[1:] + bins[:-1]) / 2.
+  centers = np.sign(centers) * (1 / (q - 1)) * (q ** np.abs(centers) - 1) 
+  return centers[x]
 
 class WaveNet(Model):
   _sampling_rate = 44100 # Hz
@@ -91,13 +97,12 @@ class WaveNet(Model):
       array = np.stack([
         np.frombuffer(channel._data, dtype=np.int16)
         for channel in segment.split_to_mono()], axis=1)
-      array = array.astype(np.float32) 
-      array /= np.iinfo(np.int16).max
       data.append(array)
-    padding = np.zeros((self.receptive_field, 2), dtype=np.float32)
+    padding = np.zeros((self.receptive_field, 2), dtype=np.float16)
     data = [data[i//2] if i % 2 else padding 
             for i in range(2 * len(data) + 1)]
     data = np.concatenate(data, axis=0)
+    data = data.astype(np.float32) / 32768.
     data = quantize(data, self._quantization)
     length = self._sampling_rate * length_secs
     def sample():
