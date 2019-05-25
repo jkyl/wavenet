@@ -2,17 +2,17 @@ from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
 
-from keras import Model
-from keras.layers import Add
-from keras.layers import Input
-from keras.layers import Lambda
-from keras.layers import Conv1D
-from keras.layers import Reshape
-from keras.layers import Multiply
-from keras.layers import Embedding
-from keras.layers import Activation
-from keras.layers import Concatenate
 from keras.backend import int_shape
+from keras.layers import Concatenate
+from keras.layers import Activation
+from keras.layers import Embedding
+from keras.layers import Multiply
+from keras.layers import Reshape
+from keras.layers import Conv1D
+from keras.layers import Lambda
+from keras.layers import Input
+from keras.layers import Add
+from keras import Model
 
 import tensorflow as tf
 import numpy as np
@@ -34,7 +34,7 @@ def _variable_scope(function):
 def CausalResidual(x, x0):
   def crop(inputs):
     x, x0 = inputs
-    length_x = tf.shape(x)[1]
+    length_x = int_shape(x)[1] or tf.shape(x)[1]
     return x0[:, -length_x:]
   x0 = Lambda(crop)([x, x0])
   extra = int_shape(x)[-1] - int_shape(x0)[-1]
@@ -60,6 +60,13 @@ def CausalBlock(x, width, octaves):
     x = CausalLayer(x, width, dilation)
   return x
 
+@_variable_scope
+def CausalSkip(tensors, receptive_field):
+  def crop(inputs):
+    return [t[:, receptive_field-1:] for t in inputs]
+  tensors = Lambda(crop)(tensors)
+  return Concatenate()(tensors)
+
 def quantize(x, q):
   compressed = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
   bins = np.linspace(-1, 1, q + 1)
@@ -76,21 +83,24 @@ class WaveNet(Model):
   _sampling_rate = 44100 # Hz
   _quantization = 256 # 8-bit
    
-  def __init__(self, blocks=5, octaves_per_block=13):
-    inp = Input((None, 2)) 
-    x = Embedding(self._quantization, 8)(inp)
-    x = Reshape((-1, 16))(x)
+  def __init__(self, channel_multiplier=32, blocks=5, octaves_per_block=13):
+    self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1) 
+    inp = Input((self.receptive_field, 2))
+    x = Embedding(self._quantization, channel_multiplier // 2)(inp)
+    x = Reshape((-1, channel_multiplier))(x)
+    skip = [x]
     for block in range(blocks):
-      x = CausalBlock(x, 16 * 2 ** block, octaves_per_block)
+      x = CausalBlock(x, channel_multiplier * 2 ** block, octaves_per_block)
+      skip.append(x)
+    x = CausalSkip(skip, self.receptive_field)
     x = Activation('relu')(x)
     x = Conv1D(2 * self._quantization, 1)(x)
     out = Reshape((-1, 2, self._quantization))(x) 
     super(WaveNet, self).__init__(inp, out)
     self.summary()
-    self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1)
     print('Receptive field:', self.receptive_field)
 
-  def get_data(self, data_dir, batch_size=4, length_secs=1):
+  def get_data(self, data_dir, batch_size=3):
     data = []
     for mp3_file in glob.glob(os.path.join(data_dir, '*.mp3')):
       segment = pydub.AudioSegment.from_mp3(mp3_file)
@@ -104,15 +114,14 @@ class WaveNet(Model):
     data = np.concatenate(data, axis=0)
     data = data.astype(np.float32) / 32768.
     data = quantize(data, self._quantization)
-    length = self._sampling_rate * length_secs
     def sample():
       while True:
-        index = np.random.randint(data.shape[0] - length)
-        chunk = data[index:index+length]
-        yield chunk[:-1], chunk[self.receptive_field:]
+        index = np.random.randint(data.shape[0] - self.receptive_field - 1)
+        chunk = data[index:index+self.receptive_field+1]
+        yield chunk[:-1], chunk[-1:]
     ds = tf.data.Dataset.from_generator(
       sample, (tf.int32, tf.int32), 
-      ((length - 1, 2), (length - self.receptive_field, 2)))
+      ((self.receptive_field, 2), (1, 2)))
     ds = ds.batch(batch_size) 
     ds = ds.prefetch(8)
     return ds.make_one_shot_iterator().get_next()
@@ -130,7 +139,7 @@ class WaveNet(Model):
       tf.nn.sparse_softmax_cross_entropy_with_logits(
         logits=logits, labels=labels))
     step = tf.train.create_global_step()
-    learning_rate = 1e-3 * 2. ** -tf.cast(step // 10000, tf.float32)
+    learning_rate = 1e-3 * 2. ** -tf.cast(step // 50000, tf.float32)
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_op = optimizer.minimize(loss, step, self.trainable_weights)
     with tf.Session() as sess:
@@ -151,10 +160,27 @@ class WaveNet(Model):
           print('saving checkpoint at iter:', iter_)
           self.fancy_save(model_dir, iter_)
           time_ = now
-          
-if __name__ == '__main__':
+
+  def generate(self, length_secs=0.1, weights_file=None):
+    import tqdm
+    if weights_file:
+      self.load_weights(weights_file)
+    length = int(length_secs * self._sampling_rate)
+    data = quantize(0.001 * np.random.normal(
+      size=(1, self.receptive_field + length, 2)
+        ), self._quantization)
+    for i in tqdm.trange(length):
+      j = self.receptive_field + i
+      input_buffer = data[:, i:j]
+      output_logits = self.predict(input_buffer)
+      output_sample = np.argmax(output_logits, axis=-1)
+      data[:, j] = output_sample
+    waveform = dequantize(data[0], self._quantization)
+    np.save('waveform.npy', waveform)
+
+if __name__ == '__main__': 
   WaveNet().train(
     '/Volumes/4TB/itunes/Josquin des Prez/Missa Pange lingua - Missa La sol fa re mi/',
-    './checkpoints'
+    '/Volumes/4TB/training/wavenet/josquin/ch64_decay50k_rf-chunks/',
   )
 
