@@ -228,6 +228,7 @@ class WaveNet(Model):
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_op = optimizer.minimize(loss, step, self.trainable_weights)
 
+    # start the session
     with tf.Session() as sess:
 
       # initialize and finalize the graph
@@ -240,7 +241,7 @@ class WaveNet(Model):
       loss_ = []
       time_ = time.time()
 
-      # begin training
+      # training loop
       while True:
         loss_ += sess.run([train_op, loss])[1:]
         iter_ += 1
@@ -259,7 +260,7 @@ class WaveNet(Model):
 
 def parse_arguments():
   p = argparse.ArgumentParser(
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   p.add_argument(
     'data_dir',
@@ -275,7 +276,7 @@ def parse_arguments():
     '-ch',
     dest='channel_multiplier',
     type=int,
-    default=16,
+    default=32,
     help='multiplicative factor for all hidden units',
   )
   p.add_argument(
@@ -303,7 +304,7 @@ def parse_arguments():
     '-ls',
     dest='length_secs',
     type=float,
-    default=2.,
+    default=1.,
     help='length in seconds of a single training example',
   )
   return vars(p.parse_args())
