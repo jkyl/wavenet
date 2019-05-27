@@ -116,6 +116,9 @@ class WaveNet(Model):
     # compute the receptive field
     self.receptive_field = blocks * 2 ** octaves_per_block - (blocks - 1)
 
+    # get the default graph
+    self.graph = tf.get_default_graph()
+
     # allow variable-length stereo inputs
     inp = Input((None, 2))
 
@@ -183,7 +186,7 @@ class WaveNet(Model):
         chunk = data[index:index+length+1]
         yield chunk[:-1], chunk[self.receptive_field:]
 
-    # construct a tf.data.Dataset object from the generator
+    # construct a Dataset object from the generator
     ds = tf.data.Dataset.from_generator(
       generator=sample,
       output_types=(tf.int32, tf.int32),
@@ -225,8 +228,14 @@ class WaveNet(Model):
     # use default Adam with learning rate decay
     step = tf.train.create_global_step()
     learning_rate = 1e-3 * 2. ** -tf.cast(step // 50000, tf.float32)
-    optimizer = tf.train.AdamOptimizer(learning_rate)
-    train_op = optimizer.minimize(loss, step, self.trainable_weights)
+    train_op = tf.train.AdamOptimizer(learning_rate).minimize(
+      loss=loss, global_step=step, var_list=self.trainable_weights)
+
+    # create some tensorboard summaries
+    tf.summary.scalar('loss', loss)
+    tf.summary.scalar('learning_rate', learning_rate)
+    summary = tf.summary.merge_all()
+    writer = tf.summary.FileWriter(model_dir, self.graph)
 
     # start the session
     with tf.Session() as sess:
@@ -234,7 +243,7 @@ class WaveNet(Model):
       # initialize and finalize the graph
       sess.run(tf.global_variables_initializer())
       self.fancy_save(model_dir)
-      tf.get_default_graph().finalize()
+      self.graph.finalize()
 
       # initialize loop variables
       iter_ = 0
@@ -248,6 +257,7 @@ class WaveNet(Model):
 
         # log the average loss for the last 100 steps
         if not iter_ % 100:
+          writer.add_summary(sess.run(summary), iter_)
           print('iter:', iter_, '\tloss:', np.mean(loss_))
           loss_ = []
 
