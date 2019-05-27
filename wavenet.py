@@ -168,9 +168,9 @@ class WaveNet(Model):
         for channel in segment.split_to_mono()], axis=1)
       data.append(array)
 
-    # zero-pad between tracks and at both ends of the album
+    # zero-pad 1 RF at both ends of the dataset
     padding = np.zeros((self.receptive_field, 2), dtype=np.float16)
-    data = [data[i//2] if i%2 else padding for i in range(2 * len(data) + 1)]
+    data = [padding] + data + [padding]
 
     # merge it all together as a [-1, 1] bounded float array
     data = np.concatenate(data, axis=0)
@@ -227,7 +227,7 @@ class WaveNet(Model):
 
     # use default Adam with learning rate decay
     step = tf.train.create_global_step()
-    learning_rate = 1e-3 * 2. ** -tf.cast(step // 50000, tf.float32)
+    learning_rate = 1e-3 * 2. ** -tf.cast(step // 250000, tf.float32)
     train_op = tf.train.AdamOptimizer(learning_rate).minimize(
       loss=loss, global_step=step, var_list=self.trainable_weights)
 
@@ -286,7 +286,7 @@ def parse_arguments():
     '-ch',
     dest='channel_multiplier',
     type=int,
-    default=32,
+    default=16,
     help='multiplicative factor for all hidden units',
   )
   p.add_argument(
@@ -314,7 +314,7 @@ def parse_arguments():
     '-ls',
     dest='length_secs',
     type=float,
-    default=1.,
+    default=2.5,
     help='length in seconds of a single training example',
   )
   return vars(p.parse_args())
