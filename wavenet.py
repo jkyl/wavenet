@@ -32,8 +32,7 @@ def variable_scoped(cls):
   '''
   for attr in dir(cls):
     method = getattr(cls, attr)
-    if callable(method) and not \
-        (attr.startswith('_') or attr.endswith('__')):
+    if callable(method) and not attr.startswith('_'):
       setattr(cls, attr, _scope(method))
   return cls
 
