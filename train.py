@@ -195,7 +195,7 @@ def parse_arguments():
     '-ch',
     dest='channel_multiplier',
     type=int,
-    default=16,
+    default=32,
     help='multiplicative factor for all hidden units',
   )
   p.add_argument(
@@ -223,7 +223,7 @@ def parse_arguments():
     '-ls',
     dest='length_secs',
     type=float,
-    default=2.5,
+    default=2.,
     help='length in seconds of a single training example',
   )
   return vars(p.parse_args())
