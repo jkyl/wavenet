@@ -349,7 +349,12 @@ def parse_arguments():
   predict = sp.add_parser(
     'predict',
     help='generate audio with a pre-trained WaveNet model'
-  ) 
+  )
+  predict.add_argument(
+    'model_dir',
+    type=str,
+    help='directory from which to load model checkpoint',
+  )
   return p.parse_args()
 
 if __name__ == '__main__':
