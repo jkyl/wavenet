@@ -210,7 +210,7 @@ def main(args):
       
       # compute the receptive field
       receptive_field = WaveNet.get_receptive_field(
-        args.blocks, args.layers_per_b  lock)
+        args.blocks, args.layers_per_block)
 
       # compute the length in samples of one training example
       length = int(args.length_secs * 44100)
