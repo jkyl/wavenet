@@ -13,7 +13,14 @@ from keras.layers import Input
 from keras.layers import Add
 
 import tensorflow as tf
+import numpy as np
 import functools
+import argparse
+import pydub
+import keras
+import glob
+import sys
+import os
 
 def _scope(function):
   '''Successive calls to `function` will be variable-scoped
@@ -38,7 +45,7 @@ def variable_scoped(cls):
 
 @variable_scoped
 class WaveNet(tuple):
-  '''Class that creates a WaveNet defined by its input and output
+  '''Class that defines a WaveNet by its input and output
   '''
   @staticmethod
   def CausalResidual(x, x0):
@@ -72,12 +79,12 @@ class WaveNet(tuple):
     return WaveNet.CausalResidual(x, x0)
 
   @staticmethod
-  def CausalBlock(x, width, depth, dilation=True):
+  def CausalBlock(x, width, depth):
     '''Creates and applies a stack of causal convolutional layers
     with optional exponentially increasing dilation rate to tensor `x`
     '''
     for layer in range(depth):
-      dilation = 2 ** layer if dilation else 1
+      dilation = 2 ** layer
       x = WaveNet.CausalLayer(x, width, dilation)
     return x
 
@@ -93,14 +100,26 @@ class WaveNet(tuple):
     tensors = Lambda(crop)(tensors)
     return Concatenate()(tensors)
 
+  @staticmethod
+  def get_receptive_field(blocks, layers_per_block):
+    '''Computes the receptive field of a WaveNet model
+    '''
+    return blocks * 2 ** layers_per_block - (blocks - 1)
+
   def __new__(
       cls,
+      mode,
       channel_multiplier,
       blocks,
       layers_per_block,
       quantization,
-      dilation,
+      **unused,
     ):
+    '''Constructor for the WaveNet model
+    '''
+    if mode != 'train':
+      raise NotImplementedError(mode)
+
     # allow variable-length stereo inputs
     inp = Input((None, 2))
 
@@ -114,7 +133,7 @@ class WaveNet(tuple):
     skip = [x]
     for block in range(blocks):
       width = channel_multiplier * 2 ** block
-      x = cls.CausalBlock(x, width, layers_per_block, dilation)
+      x = cls.CausalBlock(x, width, layers_per_block)
       skip.append(x)
 
     # concatenate all of the intermediate results
@@ -123,11 +142,218 @@ class WaveNet(tuple):
     # final layers: back to categorical variable
     x = Activation('relu')(x)
     x = Conv1D(2 * quantization, 1)(x)
-    x = Activation('relu')(x)
-    x = Conv1D(2 * quantization, 1)(x)
 
     # move stereo channels back to penultimate axis
     out = Reshape((-1, 2, quantization))(x)
 
     # return a tuple of input and output
     return tuple.__new__(WaveNet, (inp, out))
+
+def quantize(x, q):
+  '''Quantizes a signal `x` bound by the range [-1, 1] to the
+  specified number of bins `q`, first applying a mu-law transformation
+  '''
+  compressed = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
+  bins = np.linspace(-1, 1, q + 1)
+  quantized = np.digitize(compressed, bins)
+  return quantized.astype(np.int32) - 1
+
+def dequantize(x, q):
+  '''Un-bins a quantized signal `x` to a continuous one,
+  then applyies an inverse mu-law transformation
+  '''
+  bins = np.linspace(-1, 1, q + 1)
+  centers = (bins[1:] + bins[:-1]) / 2.
+  x = centers[x]
+  x = np.sign(x) * (1 / (q - 1)) * (q ** np.abs(x) - 1)
+  return x
+
+def main(args):
+  '''Entrypoint for wavenet.py
+  '''  
+  def model_fn(features, labels, mode):
+    '''Returns a WaveNet EstimatorSpec for training or prediction
+    '''
+    # train mode:
+    if mode = tf.estimator.ModeKeys.TRAIN:
+
+      # build a keras model
+      model = keras.Model(*WaveNet(**vars(args)))
+      
+      # loss is cross-entropy with the true t+1 data
+      loss = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+          logits=model(features), labels=labels))
+
+      # use default Adam with learning rate decay
+      step = tf.train.get_global_step()
+      learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
+      train_op = tf.train.AdamOptimizer(learning_rate).minimize(
+        loss=loss, global_step=step, var_list=model.trainable_weights)
+
+      # create some tensorboard summaries
+      tf.summary.scalar('loss', loss)
+      tf.summary.scalar('learning_rate', learning_rate)
+
+      # define the EstimatorSpec
+      return tf.estimator.EstimatorSpec(
+        mode=mode, loss=loss, train_op=train_op)
+
+    elif mode = tf.estimator.ModeKeys.PREDICT:
+      pass
+ 
+  def input_fn(mode):
+    '''Returns a tf.data.Dataset for training or prediction
+    '''
+    # train mode:
+    if mode == tf.estimator.ModeKeys.TRAIN:    
+      
+      # compute the receptive field
+      receptive_field = WaveNet.get_receptive_field(
+        args.blocks, args.layers_per_block)
+
+      # compute the length in samples of one training example
+      length = int(args.length_secs * 44100)
+      assert length >= receptive_field, length
+
+      # grab all of the .mp3 data
+      if os.path.isfile(args.data_dir) and args.data_dir.endswith('.mp3'):
+        files = [args.data_dir]
+      elif os.path.isdir(args.data_dir):
+        files = sorted(glob.glob(os.path.join(args.data_dir, '*.mp3')))
+      else:
+        raise OSError('{} does not exist'.format(args.data_dir))
+      data = []
+      for mp3_file in files:
+        segment = pydub.AudioSegment.from_mp3(mp3_file)
+        array = np.stack([
+          np.frombuffer(channel.raw_data, dtype=np.int16)
+          for channel in segment.split_to_mono()], axis=1)
+        if array.shape[-1] == 1:
+          array = np.tile(array, (1, 2))
+        elif array.shape[-1] != 2:
+          raise ValueError(
+            'Only mono and stereo audio supported (got {} channels)'
+              .format(array.shape[-1]))
+        data.append(array)
+
+      # zero-pad 1 RF at both ends of the dataset
+      padding = np.zeros((receptive_field, 2), dtype=np.float16)
+      data = [padding] + data + [padding]
+
+      # merge it all together as a [-1, 1] bounded float array
+      data = np.concatenate(data, axis=0)
+      data = data.astype(np.float32) / 32768.
+
+      # quantize the entire array (represent as categorical)
+      data = quantize(data, args.quantization)
+
+      # define a generator that yields samples from the array
+      def sample():
+        while True:
+          index = np.random.randint(data.shape[0]-length-1)
+          chunk = data[index:index+length+1]
+          yield chunk[:-1], chunk[receptive_field:]
+
+      # construct a Dataset object from the generator
+      ds = tf.data.Dataset.from_generator(
+        generator=sample,
+        output_types=(tf.int32, tf.int32),
+        output_shapes=((length, 2), (length - receptive_field + 1, 2)),
+      )
+      # batch the samples and prefetch
+      ds = ds.batch(args.batch_size)
+      ds = ds.prefetch(1)
+      return ds
+
+    elif mode == tf.estimator.ModeKeys.PREDICT:
+      pass
+
+  estimator = tf.estimator.Estimator(
+    model_fn=model_fn,
+    model_dir=args.model_dir,
+  )
+  if args.mode == 'train':
+    estimator.train(input_fn, steps=1000000)
+  elif args.mode == 'predict':
+    estimator.predict(input_fn)
+  raise NotImplementedError(args.mode)
+
+def parse_arguments():
+  '''Parses command line arguments to wavenet.py
+  '''
+  p = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+  )
+  sp = p.add_subparsers(dest='mode')
+  train = sp.add_parser(
+    'train',
+    help='train a WaveNet model',
+  )
+  train.add_argument(
+    'data_dir',
+    type=str,
+    help='directory containing .mp3 files to use as training data',
+  )
+  train.add_argument(
+    'model_dir',
+    type=str,
+    help='directory in which to save checkpoints and summaries',
+  )
+  train.add_argument(
+    '-ch',
+    dest='channel_multiplier',
+    type=int,
+    default=16,
+    help='multiplicative factor for all hidden units',
+  )
+  train.add_argument(
+    '-bk',
+    dest='blocks',
+    type=int,
+    default=5,
+    help='number of causal blocks in the network',
+  )
+  train.add_argument(
+    '-lp',
+    dest='layers_per_block',
+    type=int,
+    default=13,
+    help='number of dilated convolutions per causal block',
+  )
+  train.add_argument(
+    '-bs',
+    dest='batch_size',
+    type=int,
+    default=1,
+    help='number of training examples per parameter update',
+  )
+  train.add_argument(
+    '-ls',
+    dest='length_secs',
+    type=float,
+    default=2.,
+    help='length in seconds of a single training example',
+  )
+  train.add_argument(
+    '-qz',
+    dest='quantization',
+    type=int,
+    default=256,
+    help='number of bins in which to quantize the audio signal',
+  )
+  train.add_argument(
+    '-dy',
+    dest='decay',
+    type=int,
+    default=100000,
+    help='number of updates after which to halve the learning rate, successively',
+  )
+  predict = sp.add_parser(
+    'predict',
+    help='generate audio with a pre-trained WaveNet model'
+  ) 
+  return p.parse_args()
+
+if __name__ == '__main__':
+  main(parse_arguments())
