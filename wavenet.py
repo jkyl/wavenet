@@ -45,7 +45,7 @@ def variable_scoped(cls):
 
 @variable_scoped
 class WaveNet(tuple):
-  '''Class that creates a WaveNet defined by its input and output
+  '''Class that defines a WaveNet by its input and output
   '''
   @staticmethod
   def CausalResidual(x, x0):
@@ -102,6 +102,8 @@ class WaveNet(tuple):
 
   @staticmethod
   def get_receptive_field(blocks, layers_per_block):
+    '''Computes the receptive field of a WaveNet model
+    '''
     return blocks * 2 ** layers_per_block - (blocks - 1)
 
   def __new__(
@@ -113,6 +115,8 @@ class WaveNet(tuple):
       quantization,
       **unused,
     ):
+    '''Constructor for the WaveNet model
+    '''
     if mode != 'train':
       raise NotImplementedError(mode)
 
@@ -165,10 +169,14 @@ def dequantize(x, q):
   return x
 
 def main(args):
-  
+  '''Entrypoint for wavenet.py
+  '''  
   def model_fn(features, labels, mode):
-    
+    '''Returns a WaveNet EstimatorSpec for training or prediction
+    '''
     def train_model():
+      '''Builds a WaveNet training graph
+      '''
       # build a keras model
       model = keras.Model(*WaveNet(**vars(args)))
       
@@ -201,11 +209,14 @@ def main(args):
     raise NotImplementedError(mode)
  
   def input_fn(mode):
-    
+    '''Returns a tf.data.Dataset for training or prediction
+    '''
     def train_input():
+      '''Yields batches of training data from .mp3 files
+      '''
       # compute the receptive field
       receptive_field = WaveNet.get_receptive_field(
-        args.blocks, args.layers_per_block)
+        args.blocks, args.layers_per_b  lock)
 
       # compute the length in samples of one training example
       length = int(args.length_secs * 44100)
@@ -286,6 +297,8 @@ def main(args):
   raise NotImplementedError(args.mode)
 
 def parse_arguments():
+  '''Parses command line arguments to wavenet.py
+  '''
   p = argparse.ArgumentParser(
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
