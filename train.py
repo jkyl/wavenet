@@ -80,13 +80,13 @@ class Trainer(keras.Model):
       elif array.shape[-1] != 2:
         raise ValueError(
           'Only mono and stereo audio supported (got {} channels)'
-            .format(array.shape[-1])
+            .format(array.shape[-1]))
       data.append(array)
 
     # zero-pad 1 RF at both ends of the dataset
     padding = np.zeros((self.receptive_field, 2), dtype=np.float16)
     data = [padding] + data + [padding]
-    
+
     # merge it all together as a [-1, 1] bounded float array
     data = np.concatenate(data, axis=0)
     data = data.astype(np.float32) / 32768.
