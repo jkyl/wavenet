@@ -174,9 +174,9 @@ def main(args):
   def model_fn(features, labels, mode):
     '''Returns a WaveNet EstimatorSpec for training or prediction
     '''
-    def train_model():
-      '''Builds a WaveNet training graph
-      '''
+    # train mode:
+    if mode = tf.estimator.ModeKeys.TRAIN:
+
       # build a keras model
       model = keras.Model(*WaveNet(**vars(args)))
       
@@ -199,21 +199,15 @@ def main(args):
       return tf.estimator.EstimatorSpec(
         mode=mode, loss=loss, train_op=train_op)
 
-    def predict_model():
-      raise NotImplementedError(mode)
-
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      return train_model()
-    if mode == tf.estimator.ModeKeys.PREDICT:
-      return predict_model()
-    raise NotImplementedError(mode)
+    elif mode = tf.estimator.ModeKeys.PREDICT:
+      pass
  
   def input_fn(mode):
     '''Returns a tf.data.Dataset for training or prediction
     '''
-    def train_input():
-      '''Yields batches of training data from .mp3 files
-      '''
+    # train mode:
+    if mode == tf.estimator.ModeKeys.TRAIN:    
+      
       # compute the receptive field
       receptive_field = WaveNet.get_receptive_field(
         args.blocks, args.layers_per_b  lock)
@@ -270,30 +264,19 @@ def main(args):
       # batch the samples and prefetch
       ds = ds.batch(args.batch_size)
       ds = ds.prefetch(1)
-
-      # return the whole dataset
       return ds
 
-    def predict_input():
-      raise NotImplementedError(mode)
-
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      return train_input()
-    if mode == tf.estimator.ModeKeys.PREDICT:
-      return predict_input()
-    raise NotImplementedError(mode) 
+    elif mode == tf.estimator.ModeKeys.PREDICT:
+      pass
 
   estimator = tf.estimator.Estimator(
     model_fn=model_fn,
     model_dir=args.model_dir,
-    config=tf.estimator.RunConfig(
-      save_checkpoints_secs=3600,
-      save_summary_steps=10)
   )
   if args.mode == 'train':
-    return estimator.train(input_fn, steps=1000000)
-  if args.mode == 'predict':
-    return estimator.predict(input_fn)
+    estimator.train(input_fn, steps=1000000)
+  elif args.mode == 'predict':
+    estimator.predict(input_fn)
   raise NotImplementedError(args.mode)
 
 def parse_arguments():
