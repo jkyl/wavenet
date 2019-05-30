@@ -69,8 +69,14 @@ class Trainer(keras.Model):
     assert length >= self.receptive_field, length
 
     # grab all of the .mp3 data
+    if os.path.isfile(data_dir) and data_dir.endswith('.mp3'):
+      files = [data_dir]
+    elif os.path.isdir(data_dir):
+      files = sorted(glob.glob(os.path.join(data_dir, '*.mp3')))
+    else:
+      raise OSError('{} does not exist'.format(data_dir))
     data = []
-    for mp3_file in sorted(glob.glob(os.path.join(data_dir, '*.mp3'))):
+    for mp3_file in files:
       segment = pydub.AudioSegment.from_mp3(mp3_file)
       array = np.stack([
         np.frombuffer(channel.raw_data, dtype=np.int16)
@@ -142,7 +148,7 @@ class Trainer(keras.Model):
 
     # use default Adam with learning rate decay
     step = tf.train.create_global_step()
-    learning_rate = 1e-3 * 2. ** -tf.cast(step // 250000, tf.float32)
+    learning_rate = 1e-3 * 2. ** -tf.cast(step // 100000, tf.float32)
     train_op = tf.train.AdamOptimizer(learning_rate).minimize(
       loss=loss, global_step=step, var_list=self.trainable_weights)
 
