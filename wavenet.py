@@ -117,9 +117,6 @@ class WaveNet(tuple):
     ):
     '''Constructor for the WaveNet model
     '''
-    if mode != 'train':
-      raise NotImplementedError(mode)
-
     # allow variable-length stereo inputs
     inp = Input((None, 2))
 
@@ -175,7 +172,7 @@ def main(args):
     '''Returns a WaveNet EstimatorSpec for training or prediction
     '''
     # train mode:
-    if mode = tf.estimator.ModeKeys.TRAIN:
+    if mode == tf.estimator.ModeKeys.TRAIN:
 
       # build a keras model
       model = keras.Model(*WaveNet(**vars(args)))
@@ -199,7 +196,7 @@ def main(args):
       return tf.estimator.EstimatorSpec(
         mode=mode, loss=loss, train_op=train_op)
 
-    elif mode = tf.estimator.ModeKeys.PREDICT:
+    elif mode == tf.estimator.ModeKeys.PREDICT:
       pass
  
   def input_fn(mode):
