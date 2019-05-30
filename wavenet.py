@@ -72,12 +72,12 @@ class WaveNet(tuple):
     return WaveNet.CausalResidual(x, x0)
 
   @staticmethod
-  def CausalBlock(x, width, depth, dilation=True):
+  def CausalBlock(x, width, depth):
     '''Creates and applies a stack of causal convolutional layers
     with optional exponentially increasing dilation rate to tensor `x`
     '''
     for layer in range(depth):
-      dilation = 2 ** layer if dilation else 1
+      dilation = 2 ** layer
       x = WaveNet.CausalLayer(x, width, dilation)
     return x
 
@@ -93,13 +93,17 @@ class WaveNet(tuple):
     tensors = Lambda(crop)(tensors)
     return Concatenate()(tensors)
 
+  @staticmethod
+  def get_receptive_field(blocks, layers_per_block):
+    return blocks * 2 ** layers_per_block - (blocks - 1)
+
   def __new__(
       cls,
       channel_multiplier,
       blocks,
       layers_per_block,
       quantization,
-      dilation,
+      **unused,
     ):
     # allow variable-length stereo inputs
     inp = Input((None, 2))
@@ -114,15 +118,13 @@ class WaveNet(tuple):
     skip = [x]
     for block in range(blocks):
       width = channel_multiplier * 2 ** block
-      x = cls.CausalBlock(x, width, layers_per_block, dilation)
+      x = cls.CausalBlock(x, width, layers_per_block)
       skip.append(x)
 
     # concatenate all of the intermediate results
     x = cls.CausalSkip(skip)
 
     # final layers: back to categorical variable
-    x = Activation('relu')(x)
-    x = Conv1D(2 * quantization, 1)(x)
     x = Activation('relu')(x)
     x = Conv1D(2 * quantization, 1)(x)
 
