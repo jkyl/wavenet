@@ -266,15 +266,16 @@ def main(args):
     elif mode == tf.estimator.ModeKeys.PREDICT:
       pass
 
+  # create the estimator
   estimator = tf.estimator.Estimator(
     model_fn=model_fn,
     model_dir=args.model_dir,
   )
+  # either train or predict
   if args.mode == 'train':
     estimator.train(input_fn, steps=1000000)
   elif args.mode == 'predict':
     estimator.predict(input_fn)
-  raise NotImplementedError(args.mode)
 
 def parse_arguments():
   '''Parses command line arguments to wavenet.py
