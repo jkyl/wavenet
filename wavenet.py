@@ -120,7 +120,9 @@ class WaveNet(tuple):
     # concatenate all of the intermediate results
     x = cls.CausalSkip(skip)
 
-    # final layer: back to categorical variable
+    # final layers: back to categorical variable
+    x = Activation('relu')(x)
+    x = Conv1D(2 * quantization, 1)(x)
     x = Activation('relu')(x)
     x = Conv1D(2 * quantization, 1)(x)
 
