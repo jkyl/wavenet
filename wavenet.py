@@ -18,7 +18,6 @@ import functools
 import argparse
 import pydub
 import glob
-import sys
 import os
 
 def scope(function):
