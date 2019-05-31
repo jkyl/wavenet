@@ -17,12 +17,11 @@ import numpy as np
 import functools
 import argparse
 import pydub
-import keras
 import glob
 import sys
 import os
 
-def _scope(function):
+def scope(function):
   '''Successive calls to `function` will be variable-scoped
   with non-conflicting names based on `function.__name__`
   '''
@@ -33,118 +32,107 @@ def _scope(function):
       return function(*args, **kwargs)
   return wrapped
 
-def variable_scoped(cls):
-  '''Wraps all non-hidden methods of `cls` with the
-  `_scope` decorator
+@scope
+def CausalResidual(x, x0):
+  '''Creates and applies a residual connection between tensors
+  `x` and `x0` where `x0` is cropped to account for any "valid"
+  (non-padded) convolutions applied to `x`
   '''
-  for attr in dir(cls):
-    method = getattr(cls, attr)
-    if callable(method) and not attr.startswith('_'):
-      setattr(cls, attr, _scope(method))
-  return cls
+  def crop(inputs):
+    x, x0 = inputs
+    length_x = int_shape(x)[1] or tf.shape(x)[1]
+    return x0[:, -length_x:]
+  x0 = Lambda(crop)([x, x0])
+  extra = int_shape(x)[-1] - int_shape(x0)[-1]
+  if extra:
+    extra = Conv1D(extra, 1)(x0)
+    x0 = Concatenate()([x0, extra])
+  return Add()([x, x0])
 
-@variable_scoped
-class WaveNet(tuple):
-  '''Class that defines a WaveNet by its input and output
+@scope
+def CausalLayer(x, width, dilation):
+  '''Creates and applies a causal convolutional layer to tensor `x`
+  with `width`-number of output units and some `dilation` rate
   '''
-  @staticmethod
-  def CausalResidual(x, x0):
-    '''Creates and applies a residual connection between tensors
-    `x` and `x0` where `x0` is cropped to account for any "valid"
-    (non-padded) convolutions applied to `x`
-    '''
-    def crop(inputs):
-      x, x0 = inputs
-      length_x = int_shape(x)[1] or tf.shape(x)[1]
-      return x0[:, -length_x:]
-    x0 = Lambda(crop)([x, x0])
-    extra = int_shape(x)[-1] - int_shape(x0)[-1]
-    if extra:
-      extra = Conv1D(extra, 1)(x0)
-      x0 = Concatenate()([x0, extra])
-    return Add()([x, x0])
+  x0 = x
+  x = Activation('relu')(x)
+  x = Conv1D(width // 2, 1)(x)
+  x = Activation('relu')(x)
+  x = Conv1D(width // 2, 2, dilation_rate=dilation)(x)
+  x = Activation('relu')(x)
+  x = Conv1D(width, 1)(x)
+  return CausalResidual(x, x0)
 
-  @staticmethod
-  def CausalLayer(x, width, dilation):
-    '''Creates and applies a causal convolutional layer to tensor `x`
-    with `width`-number of output units and some `dilation` rate
-    '''
-    x0 = x
-    x = Activation('relu')(x)
-    x = Conv1D(width // 2, 1)(x)
-    x = Activation('relu')(x)
-    x = Conv1D(width // 2, 2, dilation_rate=dilation)(x)
-    x = Activation('relu')(x)
-    x = Conv1D(width, 1)(x)
-    return WaveNet.CausalResidual(x, x0)
+@scope
+def CausalBlock(x, width, depth):
+  '''Creates and applies a stack of causal convolutional layers
+  with optional exponentially increasing dilation rate to tensor `x`
+  '''
+  for layer in range(depth):
+    dilation = 2 ** layer
+    x = CausalLayer(x, width, dilation)
+  return x
 
-  @staticmethod
-  def CausalBlock(x, width, depth):
-    '''Creates and applies a stack of causal convolutional layers
-    with optional exponentially increasing dilation rate to tensor `x`
-    '''
-    for layer in range(depth):
-      dilation = 2 ** layer
-      x = WaveNet.CausalLayer(x, width, dilation)
-    return x
+@scope
+def CausalSkip(tensors):
+  '''Given a list of tensors, causally crops them to their smallest
+  member's length, and concatenates them along their last axis
+  '''
+  def crop(inputs):
+    min_length = tf.reduce_min(
+      [tf.shape(t)[1] for t in inputs])
+    return [t[:, -min_length:] for t in inputs]
+  tensors = Lambda(crop)(tensors)
+  return Concatenate()(tensors)
 
-  @staticmethod
-  def CausalSkip(tensors):
-    '''Given a list of tensors, causally crops them to their smallest
-    member's length, and concatenates them along their last axis
-    '''
-    def crop(inputs):
-      min_length = tf.reduce_min(
-        [tf.shape(t)[1] for t in inputs])
-      return [t[:, -min_length:] for t in inputs]
-    tensors = Lambda(crop)(tensors)
-    return Concatenate()(tensors)
+def get_receptive_field(blocks, layers_per_block):
+  '''Computes the receptive field of a WaveNet model
+  '''
+  return blocks * 2 ** layers_per_block - (blocks - 1)
 
-  @staticmethod
-  def get_receptive_field(blocks, layers_per_block):
-    '''Computes the receptive field of a WaveNet model
-    '''
-    return blocks * 2 ** layers_per_block - (blocks - 1)
+def forward_pass(
+    input_tensor, 
+    channel_multiplier,
+    blocks,
+    layers_per_block,
+    quantization, 
+    mode,
+    **unused,
+  ):
+  '''Creates and applies the WaveNet model to an input tensor
+  '''
+  # allow variable-length stereo inputs
+  inp = Input((None, 2), tensor=input_tensor)
 
-  def __new__(
-      cls,
-      mode,
-      channel_multiplier,
-      blocks,
-      layers_per_block,
-      quantization,
-      **unused,
-    ):
-    '''Constructor for the WaveNet model
-    '''
-    # allow variable-length stereo inputs
-    inp = Input((None, 2))
+  # embed categorical variables to a dense vector space
+  x = Embedding(quantization, channel_multiplier // 2)(inp)
 
-    # embed categorical variables to a dense vector space
-    x = Embedding(quantization, channel_multiplier // 2)(inp)
+  # move stereo channels to the canonical channels axis
+  x = Reshape((-1, channel_multiplier))(x)
 
-    # move stereo channels to the canonical channels axis
-    x = Reshape((-1, channel_multiplier))(x)
+  # apply a sequence of causal blocks, and cache the intermediate results
+  skip = [x]
+  for block in range(blocks):
+    width = channel_multiplier * 2 ** block
+    x = CausalBlock(x, width, layers_per_block)
+    skip.append(x)
 
-    # apply a sequence of causal blocks, and cache the intermediate results
-    skip = [x]
-    for block in range(blocks):
-      width = channel_multiplier * 2 ** block
-      x = cls.CausalBlock(x, width, layers_per_block)
-      skip.append(x)
+  # concatenate all of the intermediate results
+  x = CausalSkip(skip)
 
-    # concatenate all of the intermediate results
-    x = cls.CausalSkip(skip)
+  # final layers: back to categorical variable
+  x = Activation('relu')(x)
+  x = Conv1D(2 * quantization, 1)(x)
 
-    # final layers: back to categorical variable
-    x = Activation('relu')(x)
-    x = Conv1D(2 * quantization, 1)(x)
+  # move stereo channels back to penultimate axis
+  out = Reshape((-1, 2, quantization))(x)
+  
+  # apply softmax layer to predictions
+  if mode == tf.estimator.ModeKeys.PREDICT:
+    out = Activation('softmax')(out)
 
-    # move stereo channels back to penultimate axis
-    out = Reshape((-1, 2, quantization))(x)
-
-    # return a tuple of input and output
-    return tuple.__new__(WaveNet, (inp, out))
+  # return the output tensor
+  return out
 
 def quantize(x, q):
   '''Quantizes a signal `x` bound by the range [-1, 1] to the
@@ -174,19 +162,19 @@ def main(args):
     # train mode:
     if mode == tf.estimator.ModeKeys.TRAIN:
 
-      # build a keras model
-      model = keras.Model(*WaveNet(**vars(args)))
+      # build and apply the model to the input features
+      logits = forward_pass(features, **vars(args))
       
       # loss is cross-entropy with the true t+1 data
       loss = tf.reduce_mean(
         tf.nn.sparse_softmax_cross_entropy_with_logits(
-          logits=model(features), labels=labels))
+          logits=logits, labels=labels))
 
       # use default Adam with learning rate decay
       step = tf.train.get_global_step()
       learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
       train_op = tf.train.AdamOptimizer(learning_rate).minimize(
-        loss=loss, global_step=step, var_list=model.trainable_weights)
+        loss=loss, global_step=step)
 
       # create some tensorboard summaries
       tf.summary.scalar('loss', loss)
@@ -196,19 +184,28 @@ def main(args):
       return tf.estimator.EstimatorSpec(
         mode=mode, loss=loss, train_op=train_op)
 
+    # predict mode
     elif mode == tf.estimator.ModeKeys.PREDICT:
-      pass
+      
+      # build and apply the model to the input features
+      logits = forward_pass(features, **vars(args))
+
+      # get the predictions
+      predictions = tf.argmax(logits, axis=-1)
+
+      return tf.estimator.EstimatorSpec(
+        mode=mode, predictions=predictions)
  
   def input_fn(mode):
     '''Returns a tf.data.Dataset for training or prediction
     '''
+    # compute the receptive field
+    receptive_field = get_receptive_field(
+      args.blocks, args.layers_per_block)
+    
     # train mode:
     if mode == tf.estimator.ModeKeys.TRAIN:    
       
-      # compute the receptive field
-      receptive_field = WaveNet.get_receptive_field(
-        args.blocks, args.layers_per_block)
-
       # compute the length in samples of one training example
       length = int(args.length_secs * 44100)
       assert length >= receptive_field, length
@@ -263,8 +260,12 @@ def main(args):
       ds = ds.prefetch(1)
       return ds
 
+    # predict mode:
     elif mode == tf.estimator.ModeKeys.PREDICT:
-      pass
+      return 128 * tf.ones((1, receptive_field, 2), dtype=tf.int32)
+       
+  # enable log messages
+  tf.logging.set_verbosity(tf.logging.INFO)
 
   # create the estimator
   estimator = tf.estimator.Estimator(
@@ -275,7 +276,8 @@ def main(args):
   if args.mode == 'train':
     estimator.train(input_fn, steps=1000000)
   elif args.mode == 'predict':
-    estimator.predict(input_fn)
+    for yhat in estimator.predict(input_fn):
+      print(yhat)
 
 def parse_arguments():
   '''Parses command line arguments to wavenet.py
@@ -284,6 +286,53 @@ def parse_arguments():
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   sp = p.add_subparsers(dest='mode')
+  p.add_argument(
+    'model_dir',
+    type=str,
+    help='directory in which to save checkpoints and summaries',
+  )
+  p.add_argument(
+    '-ch',
+    dest='channel_multiplier',
+    type=int,
+    default=16,
+    help='multiplicative factor for all hidden units',
+  )
+  p.add_argument(
+    '-bk',
+    dest='blocks',
+    type=int,
+    default=5,
+    help='number of causal blocks in the network',
+  )
+  p.add_argument(
+    '-lp',
+    dest='layers_per_block',
+    type=int,
+    default=13,
+    help='number of dilated convolutions per causal block',
+  )
+  p.add_argument(
+    '-bs',
+    dest='batch_size',
+    type=int,
+    default=1,
+    help='number of training examples per parameter update',
+  )
+  p.add_argument(
+    '-ls',
+    dest='length_secs',
+    type=float,
+    default=2.,
+    help='length in seconds of a single training example',
+  )
+  p.add_argument(
+    '-qz',
+    dest='quantization',
+    type=int,
+    default=256,
+    help='number of bins in which to quantize the audio signal',
+  )
   train = sp.add_parser(
     'train',
     help='train a WaveNet model',
@@ -294,67 +343,15 @@ def parse_arguments():
     help='directory containing .mp3 files to use as training data',
   )
   train.add_argument(
-    'model_dir',
-    type=str,
-    help='directory in which to save checkpoints and summaries',
-  )
-  train.add_argument(
-    '-ch',
-    dest='channel_multiplier',
-    type=int,
-    default=16,
-    help='multiplicative factor for all hidden units',
-  )
-  train.add_argument(
-    '-bk',
-    dest='blocks',
-    type=int,
-    default=5,
-    help='number of causal blocks in the network',
-  )
-  train.add_argument(
-    '-lp',
-    dest='layers_per_block',
-    type=int,
-    default=13,
-    help='number of dilated convolutions per causal block',
-  )
-  train.add_argument(
-    '-bs',
-    dest='batch_size',
-    type=int,
-    default=1,
-    help='number of training examples per parameter update',
-  )
-  train.add_argument(
-    '-ls',
-    dest='length_secs',
-    type=float,
-    default=2.,
-    help='length in seconds of a single training example',
-  )
-  train.add_argument(
-    '-qz',
-    dest='quantization',
-    type=int,
-    default=256,
-    help='number of bins in which to quantize the audio signal',
-  )
-  train.add_argument(
     '-dy',
     dest='decay',
     type=int,
     default=100000,
-    help='number of updates after which to halve the learning rate, successively',
+    help='number of updates after which to halve the learning rate',
   )
   predict = sp.add_parser(
     'predict',
     help='generate audio with a pre-trained WaveNet model'
-  )
-  predict.add_argument(
-    'model_dir',
-    type=str,
-    help='directory from which to load model checkpoint',
   )
   return p.parse_args()
 
