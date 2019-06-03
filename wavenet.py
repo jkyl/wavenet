@@ -18,6 +18,7 @@ import functools
 import argparse
 import pydub
 import glob
+import json
 import os
 
 def scope(function):
@@ -30,6 +31,27 @@ def scope(function):
         default_name=function.__name__):
       return function(*args, **kwargs)
   return wrapped
+
+def quantize(x, q):
+  '''Quantizes a signal `x` bound by the range [-1, 1] to the
+  specified number of bins `q`, first applying a mu-law companding
+  transformation, following https://arxiv.org/abs/1609.03499,
+  section 2.2
+  '''
+  compressed = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
+  bins = np.linspace(-1, 1, q + 1)
+  quantized = np.digitize(compressed, bins)
+  return quantized.astype(np.int32) - 1
+
+def dequantize(x, q):
+  '''Un-bins a quantized signal `x` to a continuous one,
+  then applyies an inverse mu-law transformation
+  '''
+  bins = np.linspace(-1, 1, q + 1)
+  centers = (bins[1:] + bins[:-1]) / 2.
+  x = centers[x]
+  x = np.sign(x) * (1 / (q - 1)) * (q ** np.abs(x) - 1)
+  return x
 
 @scope
 def CausalResidual(x, x0):
@@ -65,7 +87,7 @@ def CausalLayer(x, width, dilation):
 @scope
 def CausalBlock(x, width, depth):
   '''Creates and applies a stack of causal convolutional layers
-  with optional exponentially increasing dilation rate to tensor `x`
+  with exponentially increasing dilation rate to tensor `x`
   '''
   for layer in range(depth):
     dilation = 2 ** layer
@@ -90,11 +112,11 @@ def get_receptive_field(blocks, layers_per_block):
   return blocks * 2 ** layers_per_block - (blocks - 1)
 
 def forward_pass(
-    input_tensor, 
+    input_tensor,
     channel_multiplier,
     blocks,
     layers_per_block,
-    quantization, 
+    quantization,
     mode,
     **unused,
   ):
@@ -125,36 +147,17 @@ def forward_pass(
 
   # move stereo channels back to penultimate axis
   out = Reshape((-1, 2, quantization))(x)
-  
-  # apply softmax layer to predictions
+
+  # apply softmax activation to predictions
   if mode == tf.estimator.ModeKeys.PREDICT:
     out = Activation('softmax')(out)
 
   # return the output tensor
   return out
 
-def quantize(x, q):
-  '''Quantizes a signal `x` bound by the range [-1, 1] to the
-  specified number of bins `q`, first applying a mu-law transformation
-  '''
-  compressed = np.sign(x) * np.log(1 + (q - 1) * np.abs(x)) / np.log(q)
-  bins = np.linspace(-1, 1, q + 1)
-  quantized = np.digitize(compressed, bins)
-  return quantized.astype(np.int32) - 1
-
-def dequantize(x, q):
-  '''Un-bins a quantized signal `x` to a continuous one,
-  then applyies an inverse mu-law transformation
-  '''
-  bins = np.linspace(-1, 1, q + 1)
-  centers = (bins[1:] + bins[:-1]) / 2.
-  x = centers[x]
-  x = np.sign(x) * (1 / (q - 1)) * (q ** np.abs(x) - 1)
-  return x
-
 def main(args):
   '''Entrypoint for wavenet.py
-  '''  
+  '''
   def model_fn(features, labels, mode):
     '''Returns a WaveNet EstimatorSpec for training or prediction
     '''
@@ -163,11 +166,16 @@ def main(args):
 
       # build and apply the model to the input features
       logits = forward_pass(features, **vars(args))
-      
+
       # loss is cross-entropy with the true t+1 data
       loss = tf.reduce_mean(
         tf.nn.sparse_softmax_cross_entropy_with_logits(
           logits=logits, labels=labels))
+
+      # get an accuracy metric
+      accuracy = tf.reduce_mean(
+        tf.cast(tf.equal(tf.argmax(
+          logits, axis=-1), labels), tf.float32))
 
       # use default Adam with learning rate decay
       step = tf.train.get_global_step()
@@ -177,6 +185,7 @@ def main(args):
 
       # create some tensorboard summaries
       tf.summary.scalar('loss', loss)
+      tf.summary.scalar('accuracy', accuracy)
       tf.summary.scalar('learning_rate', learning_rate)
 
       # define the EstimatorSpec
@@ -185,26 +194,27 @@ def main(args):
 
     # predict mode
     elif mode == tf.estimator.ModeKeys.PREDICT:
-      
+
       # build and apply the model to the input features
       logits = forward_pass(features, **vars(args))
 
       # get the predictions
       predictions = tf.argmax(logits, axis=-1)
 
+      # return an EstimatorSpec (predict mode)
       return tf.estimator.EstimatorSpec(
         mode=mode, predictions=predictions)
- 
-  def input_fn(mode):
+
+  def input_fn(mode=tf.estimator.ModeKeys.TRAIN):
     '''Returns a tf.data.Dataset for training or prediction
     '''
     # compute the receptive field
     receptive_field = get_receptive_field(
       args.blocks, args.layers_per_block)
-    
+
     # train mode:
-    if mode == tf.estimator.ModeKeys.TRAIN:    
-      
+    if mode == tf.estimator.ModeKeys.TRAIN:
+
       # compute the length in samples of one training example
       length = int(args.length_secs * 44100)
       assert length >= receptive_field, length
@@ -262,7 +272,7 @@ def main(args):
     # predict mode:
     elif mode == tf.estimator.ModeKeys.PREDICT:
       return 128 * tf.ones((1, receptive_field, 2), dtype=tf.int32)
-       
+
   # enable log messages
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -273,7 +283,10 @@ def main(args):
   )
   # either train or predict
   if args.mode == 'train':
+    with open(os.path.join(args.model_dir, 'config.json'), 'w') as f:
+      f.write(json.dumps(vars(args)))
     estimator.train(input_fn, steps=1000000)
+
   elif args.mode == 'predict':
     for yhat in estimator.predict(input_fn):
       print(yhat)
@@ -285,53 +298,6 @@ def parse_arguments():
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   sp = p.add_subparsers(dest='mode')
-  p.add_argument(
-    'model_dir',
-    type=str,
-    help='directory in which to save checkpoints and summaries',
-  )
-  p.add_argument(
-    '-ch',
-    dest='channel_multiplier',
-    type=int,
-    default=16,
-    help='multiplicative factor for all hidden units',
-  )
-  p.add_argument(
-    '-bk',
-    dest='blocks',
-    type=int,
-    default=5,
-    help='number of causal blocks in the network',
-  )
-  p.add_argument(
-    '-lp',
-    dest='layers_per_block',
-    type=int,
-    default=13,
-    help='number of dilated convolutions per causal block',
-  )
-  p.add_argument(
-    '-bs',
-    dest='batch_size',
-    type=int,
-    default=1,
-    help='number of training examples per parameter update',
-  )
-  p.add_argument(
-    '-ls',
-    dest='length_secs',
-    type=float,
-    default=2.,
-    help='length in seconds of a single training example',
-  )
-  p.add_argument(
-    '-qz',
-    dest='quantization',
-    type=int,
-    default=256,
-    help='number of bins in which to quantize the audio signal',
-  )
   train = sp.add_parser(
     'train',
     help='train a WaveNet model',
@@ -342,15 +308,67 @@ def parse_arguments():
     help='directory containing .mp3 files to use as training data',
   )
   train.add_argument(
+    'model_dir',
+    type=str,
+    help='directory in which to save checkpoints and summaries',
+  )
+  train.add_argument(
     '-dy',
     dest='decay',
     type=int,
     default=100000,
     help='number of updates after which to halve the learning rate',
   )
+  train.add_argument(
+    '-ch',
+    dest='channel_multiplier',
+    type=int,
+    default=32,
+    help='multiplicative factor for all hidden units',
+  )
+  train.add_argument(
+    '-bk',
+    dest='blocks',
+    type=int,
+    default=5,
+    help='number of causal blocks in the network',
+  )
+  train.add_argument(
+    '-lp',
+    dest='layers_per_block',
+    type=int,
+    default=13,
+    help='number of dilated convolutions per causal block',
+  )
+  train.add_argument(
+    '-bs',
+    dest='batch_size',
+    type=int,
+    default=1,
+    help='number of training examples per parameter update',
+  )
+  train.add_argument(
+    '-ls',
+    dest='length_secs',
+    type=float,
+    default=2.,
+    help='length in seconds of a single training example',
+  )
+  train.add_argument(
+    '-qz',
+    dest='quantization',
+    type=int,
+    default=256,
+    help='number of bins in which to quantize the audio signal',
+  )
   predict = sp.add_parser(
     'predict',
     help='generate audio with a pre-trained WaveNet model'
+  )
+  predict.add_argument(
+    'model_dir',
+    type=str,
+    help='directory from which to load checkpoints',
   )
   return p.parse_args()
 
