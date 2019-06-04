@@ -1,16 +1,13 @@
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
-from keras.backend import int_shape
-from keras.layers import Concatenate
-from keras.layers import Activation
-from keras.layers import Embedding
-from keras.layers import Reshape
-from keras.layers import Conv1D
-from keras.layers import Lambda
-from keras.layers import Input
-from keras.layers import Add
+from tensorflow.keras.backend import int_shape
+from tensorflow.keras.layers import Concatenate
+from tensorflow.keras.layers import Activation
+from tensorflow.keras.layers import Embedding
+from tensorflow.keras.layers import Reshape
+from tensorflow.keras.layers import Conv1D
+from tensorflow.keras.layers import Lambda
+from tensorflow.keras.layers import Input
+from tensorflow.keras.layers import Add
+from tensorflow.keras import Model
 
 import tensorflow as tf
 import numpy as np
@@ -61,8 +58,7 @@ def CausalResidual(x, x0):
   '''
   def crop(inputs):
     x, x0 = inputs
-    length_x = int_shape(x)[1] or tf.shape(x)[1]
-    return x0[:, -length_x:]
+    return x0[:, -(int_shape(x)[1] or tf.shape(x)[1]):]
   x0 = Lambda(crop)([x, x0])
   extra = int_shape(x)[-1] - int_shape(x0)[-1]
   if extra:
@@ -100,8 +96,7 @@ def CausalSkip(tensors):
   member's length, and concatenates them along their last axis
   '''
   def crop(inputs):
-    min_length = tf.reduce_min(
-      [tf.shape(t)[1] for t in inputs])
+    min_length = tf.reduce_min([tf.shape(t)[1] for t in inputs])
     return [t[:, -min_length:] for t in inputs]
   tensors = Lambda(crop)(tensors)
   return Concatenate()(tensors)
@@ -111,19 +106,17 @@ def get_receptive_field(blocks, layers_per_block):
   '''
   return blocks * 2 ** layers_per_block - (blocks - 1)
 
-def forward_pass(
-    input_tensor,
+def build_model(
+    *,
     channel_multiplier,
     blocks,
     layers_per_block,
     quantization,
-    mode,
     **unused,
   ):
-  '''Creates and applies the WaveNet model to an input tensor
+  '''Creates a WaveNet Keras model
   '''
-  # allow variable-length stereo inputs
-  inp = Input((None, 2), tensor=input_tensor)
+  inp = Input((None, 2))
 
   # embed categorical variables to a dense vector space
   x = Embedding(quantization, channel_multiplier // 2)(inp)
@@ -131,7 +124,7 @@ def forward_pass(
   # move stereo channels to the canonical channels axis
   x = Reshape((-1, channel_multiplier))(x)
 
-  # apply a sequence of causal blocks, and cache the intermediate results
+  # apply a sequence of causal blocks
   skip = [x]
   for block in range(blocks):
     width = channel_multiplier * 2 ** block
@@ -148,70 +141,31 @@ def forward_pass(
   # move stereo channels back to penultimate axis
   out = Reshape((-1, 2, quantization))(x)
 
-  # apply softmax activation to predictions
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    out = Activation('softmax')(out)
-
   # return the output tensor
-  return out
+  return Model(inp, out)
+
+def save_output(wav_filepath, dequantized_audio):
+  pass
 
 def main(args):
   '''Entrypoint for wavenet.py
   '''
-  def model_fn(features, labels, mode):
-    '''Returns a WaveNet EstimatorSpec for training or prediction
+  if args.mode == 'predict':
+    # get the configuration of the trained model
+    with open(os.path.join(args.model_dir, 'config.json')) as f:
+      config = json.loads(f.read())
+      config.update(vars(args))
+      args = argparse.Namespace(**config)
+
+  # compute the receptive field
+  receptive_field = get_receptive_field(
+    args.blocks, args.layers_per_block)
+
+  @scope
+  def input_fn(mode):
+    '''Returns a tf.data.Dataset for training,
+    or a seed tensor sfor generation
     '''
-    # train mode:
-    if mode == tf.estimator.ModeKeys.TRAIN:
-
-      # build and apply the model to the input features
-      logits = forward_pass(features, **vars(args))
-
-      # loss is cross-entropy with the true t+1 data
-      loss = tf.reduce_mean(
-        tf.nn.sparse_softmax_cross_entropy_with_logits(
-          logits=logits, labels=labels))
-
-      # get an accuracy metric
-      accuracy = tf.reduce_mean(
-        tf.cast(tf.equal(tf.argmax(
-          logits, axis=-1), labels), tf.float32))
-
-      # use default Adam with learning rate decay
-      step = tf.train.get_global_step()
-      learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
-      train_op = tf.train.AdamOptimizer(learning_rate).minimize(
-        loss=loss, global_step=step)
-
-      # create some tensorboard summaries
-      tf.summary.scalar('loss', loss)
-      tf.summary.scalar('accuracy', accuracy)
-      tf.summary.scalar('learning_rate', learning_rate)
-
-      # define the EstimatorSpec
-      return tf.estimator.EstimatorSpec(
-        mode=mode, loss=loss, train_op=train_op)
-
-    # predict mode
-    elif mode == tf.estimator.ModeKeys.PREDICT:
-
-      # build and apply the model to the input features
-      logits = forward_pass(features, **vars(args))
-
-      # get the predictions
-      predictions = tf.argmax(logits, axis=-1)
-
-      # return an EstimatorSpec (predict mode)
-      return tf.estimator.EstimatorSpec(
-        mode=mode, predictions=predictions)
-
-  def input_fn(mode=tf.estimator.ModeKeys.TRAIN):
-    '''Returns a tf.data.Dataset for training or prediction
-    '''
-    # compute the receptive field
-    receptive_field = get_receptive_field(
-      args.blocks, args.layers_per_block)
-
     # train mode:
     if mode == tf.estimator.ModeKeys.TRAIN:
 
@@ -269,9 +223,79 @@ def main(args):
       ds = ds.prefetch(1)
       return ds
 
-    # predict mode:
-    elif mode == tf.estimator.ModeKeys.PREDICT:
-      return 128 * tf.ones((1, receptive_field, 2), dtype=tf.int32)
+    # seed the generative model with a blank slate
+    seed = np.zeros((1, receptive_field, 2), dtype=np.float32)
+
+    # randomize the last sample
+    seed[:, -1] = np.clip(np.random.normal(), -1, 1)
+
+    # quantize
+    seed = quantize(seed, args.quantization)
+
+    # return as constant
+    return tf.constant(seed)
+
+  def model_fn(features, labels, mode):
+    '''Returns a WaveNet EstimatorSpec for training or prediction
+    '''
+    # build the model
+    model = build_model(**vars(args))
+
+    # train mode:
+    if mode == tf.estimator.ModeKeys.TRAIN:
+
+      # apply the model to the input features
+      logits = model(features)
+
+      # loss is cross-entropy with the true t+1 data
+      loss = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+          logits=logits, labels=labels))
+
+      # use default Adam with learning rate decay
+      step = tf.train.get_global_step()
+      learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
+      train_op = tf.train.AdamOptimizer(learning_rate).minimize(
+        loss=loss, global_step=step)
+
+      # get an accuracy metric
+      accuracy = tf.reduce_mean(
+        tf.cast(tf.equal(tf.cast(tf.argmax(
+          logits, axis=-1), tf.int32), labels), tf.float32))
+
+      # create some tensorboard summaries
+      tf.summary.scalar('loss', loss)
+      tf.summary.scalar('accuracy', accuracy)
+      tf.summary.scalar('learning_rate', learning_rate)
+
+      # save the command line args after model_dir is created
+      class ConfigSaverHook(tf.train.SessionRunHook):
+        def after_create_session(self, session, coord):
+          with open(os.path.join(args.model_dir, 'config.json'), 'w') as f:
+            f.write(json.dumps(vars(args)))
+
+      # return an EstimatorSpec (train mode)
+      return tf.estimator.EstimatorSpec(
+        mode=mode,
+        loss=loss,
+        train_op=train_op,
+        training_hooks=[ConfigSaverHook()],
+      )
+
+    # do autoregressive predictions
+    _, predictions = tf.while_loop(
+      lambda i, _: tf.less(i, 44100),
+      lambda i, f: [i + 1,
+        tf.concat([f, tf.argmax(model(f[:,-receptive_field:]),
+          axis=-1, output_type=tf.int32)], axis=1)],
+      [tf.constant(0), features],
+      shape_invariants=[
+        tf.TensorShape([]),
+        tf.TensorShape([1, None, 2])]
+    )
+    # return an EstimatorSpec (predict mode)
+    return tf.estimator.EstimatorSpec(
+      mode=mode, predictions=predictions)
 
   # enable log messages
   tf.logging.set_verbosity(tf.logging.INFO)
@@ -280,16 +304,23 @@ def main(args):
   estimator = tf.estimator.Estimator(
     model_fn=model_fn,
     model_dir=args.model_dir,
+    config=tf.estimator.RunConfig(
+      train_distribute=tf.distribute.MirroredStrategy()
+        if args.multi_gpu else None),
   )
-  # either train or predict
+  # dispatch training
   if args.mode == 'train':
-    with open(os.path.join(args.model_dir, 'config.json'), 'w') as f:
-      f.write(json.dumps(vars(args)))
     estimator.train(input_fn, steps=1000000)
 
+  # dispatch generation
   elif args.mode == 'predict':
-    for yhat in estimator.predict(input_fn):
-      print(yhat)
+    output =  next(estimator.predict(input_fn))
+
+    # postprocess result
+    waveform = dequantize(output, args.quantization)
+
+    # save to .wav file
+    save_output(args.output_wav, waveform)
 
 def parse_arguments():
   '''Parses command line arguments to wavenet.py
@@ -345,7 +376,7 @@ def parse_arguments():
     dest='batch_size',
     type=int,
     default=1,
-    help='number of training examples per parameter update',
+    help='number of training examples per replica per parameter update',
   )
   train.add_argument(
     '-ls',
@@ -361,6 +392,11 @@ def parse_arguments():
     default=256,
     help='number of bins in which to quantize the audio signal',
   )
+  train.add_argument(
+    '--multi_gpu',
+    action='store_true',
+    help='whether to use a MirroredStrategy across all GPUs for training',
+  )
   predict = sp.add_parser(
     'predict',
     help='generate audio with a pre-trained WaveNet model'
@@ -368,7 +404,19 @@ def parse_arguments():
   predict.add_argument(
     'model_dir',
     type=str,
-    help='directory from which to load checkpoints',
+    help='directory from which to load the latest checkpoint',
+  )
+  predict.add_argument(
+    'output_wav',
+    type=str,
+    help='.wav filepath in which to save the generated waveform',
+  )
+  predict.add_argument(
+    '-ls',
+    dest='length_secs',
+    type=float,
+    default=1.,
+    help='length in seconds of the generated waveform',
   )
   return p.parse_args()
 
