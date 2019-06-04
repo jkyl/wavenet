@@ -161,7 +161,6 @@ def main(args):
   receptive_field = get_receptive_field(
     args.blocks, args.layers_per_block)
 
-  @scope
   def input_fn(mode):
     '''Returns a tf.data.Dataset for training,
     or a seed tensor sfor generation
