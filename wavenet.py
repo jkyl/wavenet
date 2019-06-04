@@ -340,7 +340,7 @@ def parse_arguments():
   sp = p.add_subparsers(dest='mode')
   train = sp.add_parser(
     'train',
-    help='train a WaveNet model',
+    help='train a WaveNet model on some audio data',
   )
   train.add_argument(
     'data_dir',
@@ -351,13 +351,6 @@ def parse_arguments():
     'model_dir',
     type=str,
     help='directory in which to save checkpoints and summaries',
-  )
-  train.add_argument(
-    '-dy',
-    dest='decay',
-    type=int,
-    default=100000,
-    help='number of updates after which to halve the learning rate',
   )
   train.add_argument(
     '-ch',
@@ -402,7 +395,15 @@ def parse_arguments():
     help='number of bins in which to quantize the audio signal',
   )
   train.add_argument(
-    '--multi_gpu',
+    '-dy',
+    dest='decay',
+    type=int,
+    default=100000,
+    help='number of updates after which to halve the learning rate',
+  )
+  train.add_argument(
+    '-mg',
+    dest='multi_gpu',
     action='store_true',
     help='whether to use a MirroredStrategy across all GPUs for training',
   )
