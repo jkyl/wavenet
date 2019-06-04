@@ -106,6 +106,20 @@ def get_receptive_field(blocks, layers_per_block):
   '''
   return blocks * 2 ** layers_per_block - (blocks - 1)
 
+def save_output(output_filepath, stereo_array):
+  '''Writes a stereo array to the output filepath --
+  accepts .wav, .mp3, .ogg, or anything else supported by ffmpeg
+  '''
+  pydub.AudioSegment.from_mono_audiosegments(*[
+    pydub.AudioSegment(
+      (channel * 32768).astype(np.int16).tobytes(),
+      frame_rate=44100,
+      sample_width=np.dtype(np.int16).itemsize,
+      channels=1,
+    )
+    for channel in stereo_array.reshape((-1, 2)).T
+  ]).export(output_filepath, format=output_filepath.split('.')[-1])
+
 def build_model(
     *,
     channel_multiplier,
@@ -144,9 +158,6 @@ def build_model(
   # return the output tensor
   return Model(inp, out)
 
-def save_output(wav_filepath, dequantized_audio):
-  pass
-
 def main(args):
   '''Entrypoint for wavenet.py
   '''
@@ -163,76 +174,76 @@ def main(args):
 
   def input_fn(mode):
     '''Returns a tf.data.Dataset for training,
-    or a seed tensor sfor generation
+    or a seed tensor for generation
     '''
-    # train mode:
-    if mode == tf.estimator.ModeKeys.TRAIN:
+    # predict mode:
+    if mode == tf.estimator.ModeKeys.PREDICT:
 
-      # compute the length in samples of one training example
-      length = int(args.length_secs * 44100)
-      assert length >= receptive_field, length
+      # seed the generative model with a blank slate
+      seed = np.zeros((1, receptive_field, 2), dtype=np.float32)
 
-      # grab all of the .mp3 data
-      if os.path.isfile(args.data_dir) and args.data_dir.endswith('.mp3'):
-        files = [args.data_dir]
-      elif os.path.isdir(args.data_dir):
-        files = sorted(glob.glob(os.path.join(args.data_dir, '*.mp3')))
-      else:
-        raise OSError('{} does not exist'.format(args.data_dir))
-      data = []
-      for mp3_file in files:
-        segment = pydub.AudioSegment.from_mp3(mp3_file)
-        array = np.stack([
-          np.frombuffer(channel.raw_data, dtype=np.int16)
-          for channel in segment.split_to_mono()], axis=1)
-        if array.shape[-1] == 1:
-          array = np.tile(array, (1, 2))
-        elif array.shape[-1] != 2:
-          raise ValueError(
-            'Only mono and stereo audio supported (got {} channels)'
-              .format(array.shape[-1]))
-        data.append(array)
+      # randomize the last sample
+      seed[:, -1] = np.clip(np.random.normal(), -1, 1)
 
-      # zero-pad 1 RF at both ends of the dataset
-      padding = np.zeros((receptive_field, 2), dtype=np.float16)
-      data = [padding] + data + [padding]
+      # quantize
+      seed = quantize(seed, args.quantization)
 
-      # merge it all together as a [-1, 1] bounded float array
-      data = np.concatenate(data, axis=0)
-      data = data.astype(np.float32) / 32768.
+      # return as constant
+      return tf.constant(seed)
 
-      # quantize the entire array (represent as categorical)
-      data = quantize(data, args.quantization)
+    # compute the length in samples of one training example
+    length = int(args.length_secs * 44100)
+    assert length >= receptive_field, length
 
-      # define a generator that yields samples from the array
-      def sample():
-        while True:
-          index = np.random.randint(data.shape[0]-length-1)
-          chunk = data[index:index+length+1]
-          yield chunk[:-1], chunk[receptive_field:]
+    # grab all of the .mp3 data
+    if os.path.isfile(args.data_dir) and args.data_dir.endswith('.mp3'):
+      files = [args.data_dir]
+    elif os.path.isdir(args.data_dir):
+      files = sorted(glob.glob(os.path.join(args.data_dir, '*.mp3')))
+    else:
+      raise OSError('{} does not exist'.format(args.data_dir))
+    data = []
+    for mp3_file in files:
+      segment = pydub.AudioSegment.from_mp3(mp3_file)
+      array = np.stack([
+        np.frombuffer(channel.raw_data, dtype=np.int16)
+        for channel in segment.split_to_mono()], axis=1)
+      if array.shape[-1] == 1:
+        array = np.tile(array, (1, 2))
+      elif array.shape[-1] != 2:
+        raise ValueError(
+          'Only mono and stereo audio supported (got {} channels)'
+            .format(array.shape[-1]))
+      data.append(array)
 
-      # construct a Dataset object from the generator
-      ds = tf.data.Dataset.from_generator(
-        generator=sample,
-        output_types=(tf.int32, tf.int32),
-        output_shapes=((length, 2), (length - receptive_field + 1, 2)),
-      )
-      # batch the samples and prefetch
-      ds = ds.batch(args.batch_size)
-      ds = ds.prefetch(1)
-      return ds
+    # zero-pad 1 RF at both ends of the dataset
+    padding = np.zeros((receptive_field, 2), dtype=np.float16)
+    data = [padding] + data + [padding]
 
-    # seed the generative model with a blank slate
-    seed = np.zeros((1, receptive_field, 2), dtype=np.float32)
+    # merge it all together as a [-1, 1] bounded float array
+    data = np.concatenate(data, axis=0)
+    data = data.astype(np.float32) / 32768.
 
-    # randomize the last sample
-    seed[:, -1] = np.clip(np.random.normal(), -1, 1)
+    # quantize the entire array (represent as categorical)
+    data = quantize(data, args.quantization)
 
-    # quantize
-    seed = quantize(seed, args.quantization)
+    # define a generator that yields samples from the array
+    def sample():
+      while True:
+        index = np.random.randint(data.shape[0]-length-1)
+        chunk = data[index:index+length+1]
+        yield chunk[:-1], chunk[receptive_field:]
 
-    # return as constant
-    return tf.constant(seed)
+    # construct a Dataset object from the generator
+    ds = tf.data.Dataset.from_generator(
+      generator=sample,
+      output_types=(tf.int32, tf.int32),
+      output_shapes=((length, 2), (length - receptive_field + 1, 2)),
+    )
+    # batch the samples and prefetch
+    ds = ds.batch(args.batch_size)
+    ds = ds.prefetch(1)
+    return ds
 
   def model_fn(features, labels, mode):
     '''Returns a WaveNet EstimatorSpec for training or prediction
@@ -240,62 +251,61 @@ def main(args):
     # build the model
     model = build_model(**vars(args))
 
-    # train mode:
-    if mode == tf.estimator.ModeKeys.TRAIN:
+    # predict mode:
+    if mode == tf.estimator.ModeKeys.PREDICT:
 
-      # apply the model to the input features
-      logits = model(features)
-
-      # loss is cross-entropy with the true t+1 data
-      loss = tf.reduce_mean(
-        tf.nn.sparse_softmax_cross_entropy_with_logits(
-          logits=logits, labels=labels))
-
-      # use default Adam with learning rate decay
-      step = tf.train.get_global_step()
-      learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
-      train_op = tf.train.AdamOptimizer(learning_rate).minimize(
-        loss=loss, global_step=step)
-
-      # get an accuracy metric
-      accuracy = tf.reduce_mean(
-        tf.cast(tf.equal(tf.cast(tf.argmax(
-          logits, axis=-1), tf.int32), labels), tf.float32))
-
-      # create some tensorboard summaries
-      tf.summary.scalar('loss', loss)
-      tf.summary.scalar('accuracy', accuracy)
-      tf.summary.scalar('learning_rate', learning_rate)
-
-      # save the command line args after model_dir is created
-      class ConfigSaverHook(tf.train.SessionRunHook):
-        def after_create_session(self, session, coord):
-          with open(os.path.join(args.model_dir, 'config.json'), 'w') as f:
-            f.write(json.dumps(vars(args)))
-
-      # return an EstimatorSpec (train mode)
-      return tf.estimator.EstimatorSpec(
-        mode=mode,
-        loss=loss,
-        train_op=train_op,
-        training_hooks=[ConfigSaverHook()],
+      # do autoregressive predictions
+      _, predictions = tf.while_loop(
+        lambda i, _: tf.less(i, int(args.length_secs * 44100)),
+        lambda i, f: [i + 1,
+          tf.concat([f, tf.argmax(model(f[:,-receptive_field:]),
+            axis=-1, output_type=tf.int32)], axis=1)],
+        [tf.constant(0), features],
+        shape_invariants=[
+          tf.TensorShape([]),
+          tf.TensorShape([1, None, 2])]
       )
+      # return an EstimatorSpec (predict mode)
+      return tf.estimator.EstimatorSpec(
+        mode=mode, predictions=predictions)
 
-    # do autoregressive predictions
-    _, predictions = tf.while_loop(
-      lambda i, _: tf.less(i, 44100),
-      lambda i, f: [i + 1,
-        tf.concat([f, tf.argmax(model(f[:,-receptive_field:]),
-          axis=-1, output_type=tf.int32)], axis=1)],
-      [tf.constant(0), features],
-      shape_invariants=[
-        tf.TensorShape([]),
-        tf.TensorShape([1, None, 2])]
-    )
-    # return an EstimatorSpec (predict mode)
+    # apply the model to the input features
+    logits = model(features)
+
+    # loss is cross-entropy with the true t+1 data
+    loss = tf.reduce_mean(
+      tf.nn.sparse_softmax_cross_entropy_with_logits(
+        logits=logits, labels=labels))
+
+    # use default Adam with learning rate decay
+    step = tf.train.get_global_step()
+    learning_rate = 1e-3 * 2. ** -tf.cast(step // args.decay, tf.float32)
+    train_op = tf.train.AdamOptimizer(learning_rate).minimize(
+      loss=loss, global_step=step)
+
+    # get an accuracy metric
+    accuracy = tf.reduce_mean(
+      tf.cast(tf.equal(tf.cast(tf.argmax(
+        logits, axis=-1), tf.int32), labels), tf.float32))
+
+    # create some tensorboard summaries
+    tf.summary.scalar('loss', loss)
+    tf.summary.scalar('accuracy', accuracy)
+    tf.summary.scalar('learning_rate', learning_rate)
+
+    # save the command line args after model_dir is created
+    class ConfigSaverHook(tf.train.SessionRunHook):
+      def after_create_session(self, session, coord):
+        with open(os.path.join(args.model_dir, 'config.json'), 'w') as f:
+          f.write(json.dumps(vars(args)))
+
+    # return an EstimatorSpec (train mode)
     return tf.estimator.EstimatorSpec(
-      mode=mode, predictions=predictions)
-
+      mode=mode,
+      loss=loss,
+      train_op=train_op,
+      training_hooks=[ConfigSaverHook()],
+    )
   # enable log messages
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -313,13 +323,13 @@ def main(args):
 
   # dispatch generation
   elif args.mode == 'predict':
-    output =  next(estimator.predict(input_fn))
+    output = next(estimator.predict(input_fn))
 
     # postprocess result
     waveform = dequantize(output, args.quantization)
 
     # save to .wav file
-    save_output(args.output_wav, waveform)
+    save_output(args.output_file, waveform)
 
 def parse_arguments():
   '''Parses command line arguments to wavenet.py
@@ -406,9 +416,9 @@ def parse_arguments():
     help='directory from which to load the latest checkpoint',
   )
   predict.add_argument(
-    'output_wav',
+    'output_file',
     type=str,
-    help='.wav filepath in which to save the generated waveform',
+    help='.wav or .mp3 filepath in which to save the generated waveform',
   )
   predict.add_argument(
     '-ls',
