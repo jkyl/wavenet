@@ -3,13 +3,13 @@ A TensorFlow implementation of [WaveNet: A Generative Model for Raw Audio](https
 
 ## Setup
 ```
-$ python3 -m pip install tensorflow-gpu==1.14rc0 pydub
+$ python3 -m pip install -r requirements.txt
 ```
 
 ## Usage
 ### Synposis
 ```
-$ python wavenet.py --help                                                                                                     
+$ python3 wavenet.py --help                                                                                                     
 usage: wavenet.py [-h] {train,predict} ...
 
 positional arguments:
@@ -22,7 +22,7 @@ optional arguments:
 ```
 ### Training
 ```
-$ python wavenet.py train --help
+$ python3 wavenet.py train --help
 usage: wavenet.py train [-h] [-ch CHANNEL_MULTIPLIER] [-bk BLOCKS]
                         [-lp LAYERS_PER_BLOCK] [-bs BATCH_SIZE]
                         [-ls LENGTH_SECS] [-qz QUANTIZATION] [-dy DECAY] [-mg]
@@ -50,7 +50,7 @@ optional arguments:
 ```
 ### Prediction
 ```
-$ python wavenet.py predict --help
+$ python3 wavenet.py predict --help
 usage: wavenet.py predict [-h] [-ls LENGTH_SECS] model_dir output_file
 
 positional arguments:
