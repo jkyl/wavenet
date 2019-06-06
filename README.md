@@ -1,5 +1,5 @@
 # WaveNet
-_[cf. the original paper here](https://arxiv.org/abs/1609.03499)
+[_cf. the original paper here_](https://arxiv.org/abs/1609.03499)
 
 ## Setup
 ```
