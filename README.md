@@ -9,7 +9,7 @@ $ python3 -m pip install -r requirements.txt
 ## Usage
 ### Synposis
 ```
-$ python3 wavenet.py --help                                                                                                     
+$ python3 wavenet.py --help
 usage: wavenet.py [-h] {train,predict} ...
 
 positional arguments:
