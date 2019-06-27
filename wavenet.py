@@ -1,4 +1,6 @@
+from tensorflow.keras.initializers import RandomUniform
 from tensorflow.keras.backend import int_shape
+
 from tensorflow.keras.layers import Concatenate
 from tensorflow.keras.layers import Activation
 from tensorflow.keras.layers import Embedding
@@ -133,7 +135,8 @@ def build_model(
   inp = Input((None, 2))
 
   # embed categorical variables to a dense vector space
-  x = Embedding(quantization, channel_multiplier // 2)(inp)
+  x = Embedding(quantization, channel_multiplier // 2, 
+    embeddings_initializer=RandomUniform(0, 1))(inp)
 
   # move stereo channels to the canonical channels axis
   x = Reshape((-1, channel_multiplier))(x)
